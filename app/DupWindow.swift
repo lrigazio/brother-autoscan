@@ -1,6 +1,12 @@
 import Cocoa
 import PDFKit
 
+func appLog(_ s: String) {
+  let f = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/autoscan.log")
+  let line = "[\(Date())] \(s)\n"
+  if let h = try? FileHandle(forWritingTo: f) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() } else { try? line.write(to: f, atomically: true, encoding: .utf8) }
+}
+
 /// Window that lets the controller handle keys before AppKit does (arrow keys, space, ...).
 final class KeyWindow: NSWindow {
   var onKey: ((NSEvent) -> Bool)?
@@ -223,10 +229,24 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     a.informativeText = "Frees \(ByteCountFormatter.string(fromByteCount: Int64(size(paths)), countStyle: .file)). You can restore them from the Trash."
     a.addButton(withTitle: "Move to Trash"); a.addButton(withTitle: "Cancel")
     guard a.runModal() == .alertFirstButtonReturn else { return }
-    NSWorkspace.shared.recycle(paths.map { URL(fileURLWithPath: $0) }) { _, err in
+    let want = Set(paths)
+    NSWorkspace.shared.recycle(want.map { URL(fileURLWithPath: $0) }) { trashed, err in
       DispatchQueue.main.async {
-        if let err = err { self.status.stringValue = "Trash error: \(err.localizedDescription)" }
-        self.remove.subtract(paths); self.rescan()
+        var failed = want.subtracting(Set(trashed.keys.map { $0.path }))
+        var why = [String]()
+        if let err = err { why.append(err.localizedDescription) }
+        for p in failed {   // second attempt through FileManager
+          do { try FileManager.default.trashItem(at: URL(fileURLWithPath: p), resultingItemURL: nil); failed.remove(p) }
+          catch { why.append("\((p as NSString).lastPathComponent): \(error.localizedDescription)") }
+        }
+        appLog("trash: requested \(want.count), failed \(failed.count) \(why)")
+        if !failed.isEmpty {
+          let al = NSAlert(); al.alertStyle = .warning
+          al.messageText = "Could not move \(failed.count) file\(failed.count == 1 ? "" : "s") to the Trash"
+          al.informativeText = (why.prefix(4).joined(separator: "\n")) + "\n\nIf this says the operation is not permitted: System Settings > Privacy & Security > Files and Folders (or Full Disk Access) - allow AutoScan to change files in Documents."
+          al.runModal()
+        }
+        self.remove.subtract(want.subtracting(failed)); self.rescan()
       }
     }
   }
