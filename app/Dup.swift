@@ -18,7 +18,7 @@ struct PageRec: Codable {
 }
 struct DocRec: Codable { var sha: String; var ocrVersion: Int; var created: Double; var pages: [PageRec] }
 struct IndexEntry: Codable { var size: Int; var mtime: Double; var sha: String }
-let ocrVersion = 1
+let ocrVersion = 2     // 2: multi-language OCR (es, tr, it, ja, fr, de, pt, zh)
 
 final class Store {
   static let shared = Store()
@@ -164,6 +164,8 @@ func rotated(_ img: CGImage, _ o: CGImagePropertyOrientation) -> CGImage {
 
 private let moneyRE = try! NSRegularExpression(pattern: #"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?|\d+[.,]\d{2}(?!\d)"#)
 private let dateRE = try! NSRegularExpression(pattern: #"(?<![\d/.-])\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}(?![\d])"#)
+private let cjkDateRE = try! NSRegularExpression(pattern: #"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"#)
+private let yenRE = try! NSRegularExpression(pattern: #"(\d[\d,]*)\s*円"#)
 private let timeRE = try! NSRegularExpression(pattern: #"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)"#)
 
 /// Words and numbers, plus whole amounts ("$4266"), dates ("@3/21/25") and times ("~21:33"). Those carry
@@ -177,6 +179,8 @@ func tokenize(_ s: String) -> [String] {
     let parts = ns.substring(with: m.range).components(separatedBy: CharacterSet(charactersIn: "/.-")).map { String(Int($0) ?? 0) }
     out.append("@" + parts.joined(separator: "/"))
   }
+  for m in cjkDateRE.matches(in: f, range: r) { out.append("@" + (1...3).map { String(Int(ns.substring(with: m.range(at: $0))) ?? 0) }.joined(separator: "/")) }
+  for m in yenRE.matches(in: f, range: r) { out.append("$" + ns.substring(with: m.range(at: 1)).filter { $0.isNumber }) }
   for m in timeRE.matches(in: f, range: r) { out.append("~" + ns.substring(with: m.range)) }
   return out
 }
@@ -193,7 +197,11 @@ func recognizeLines(_ original: CGImage) -> (lines: [OCRLine], orientation: CGIm
   func run(_ o: CGImagePropertyOrientation) -> ([OCRLine], Float) {
     let req = VNRecognizeTextRequest()
     req.recognitionLevel = .accurate; req.usesLanguageCorrection = false
-    if let langs = try? req.supportedRecognitionLanguages(), langs.contains("es-ES") { req.recognitionLanguages = ["es-ES", "en-US"] }
+    if let langs = try? req.supportedRecognitionLanguages() {
+      let want = ["en-US", "es-ES", "tr-TR", "it-IT", "ja-JP", "fr-FR", "de-DE", "pt-BR", "zh-Hans"].filter { langs.contains($0) }
+      if !want.isEmpty { req.recognitionLanguages = want }
+    }
+    if #available(macOS 13.0, *) { req.automaticallyDetectsLanguage = true }
     try? VNImageRequestHandler(cgImage: img, orientation: o).perform([req])
     var lines = [OCRLine](), score: Float = 0
     for ob in req.results ?? [] {
@@ -279,12 +287,11 @@ func comparePages(_ a: PageRec, _ ta: Set<String>, _ na: Set<String>, _ b: PageR
     let why = String(format: "text %.0f%%%@", cont * 100, nMin >= 3 ? String(format: ", numbers %.0f%%", nCont * 100) : "")
     if textOK { return ratio >= 0.5 ? Match(tier: .duplicate, score: cont, reason: why + (pd <= 8 ? ", same look" : ""))
                                     : Match(tier: .possible, score: cont, reason: why + " (one is a partial crop)") }
-    if pd <= 3 { return Match(tier: .possible, score: 0.5, reason: "looks the same but text differs") }
-    if cont >= 0.7 && nMin >= 3 && nCont >= 0.6 { return Match(tier: .possible, score: cont, reason: why) }
+    if cont >= 0.7 && nMin >= 3 && nCont >= 0.75 { return Match(tier: .possible, score: cont, reason: why) }
     return nil
   }
-  if pd <= 6 { return Match(tier: .duplicate, score: 1 - Double(pd) / 64, reason: "same image (distance \(pd)/64)") }
-  if pd <= 12 { return Match(tier: .possible, score: 1 - Double(pd) / 64, reason: "similar image (distance \(pd)/64)") }
+  if pd <= 2 { return Match(tier: .duplicate, score: 1 - Double(pd) / 64, reason: "same image (distance \(pd)/64)") }
+  if pd <= 8 { return Match(tier: .possible, score: 1 - Double(pd) / 64, reason: "similar image (distance \(pd)/64)") }
   return nil
 }
 
