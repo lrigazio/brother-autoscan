@@ -47,6 +47,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
   var scanning = false, emptyFeeder = false
   var poll: Timer?
   var statusItem: NSStatusItem!
+  let dups = DupController()
 
   var dir: String {
     get { defaults.string(forKey: "dir") ?? NSString("~/Documents/Scans").expandingTildeInPath }
@@ -59,15 +60,29 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     statusItem.button?.image = NSImage(systemSymbolName: "scanner", accessibilityDescription: "AutoScan") ?? NSImage(systemSymbolName: "doc.viewfinder", accessibilityDescription: "AutoScan")
     let m = NSMenu()
     m.addItem(NSMenuItem(title: "Show AutoScan Window", action: #selector(showWindow), keyEquivalent: ""))
+    m.addItem(NSMenuItem(title: "Find Duplicates...", action: #selector(findDups), keyEquivalent: "d"))
     m.addItem(.separator())
     m.addItem(NSMenuItem(title: "Quit AutoScan", action: #selector(quit), keyEquivalent: "q"))
     for i in m.items { i.target = self }
     statusItem.menu = m
     browser.delegate = self
     browser.browsedDeviceTypeMask = ICDeviceTypeMask(rawValue: ICDeviceTypeMask.scanner.rawValue | ICDeviceLocationTypeMask.local.rawValue)!
-    browser.start()
+    if ProcessInfo.processInfo.environment["AUTOSCAN_DUPDIR"] == nil { browser.start() }
+    // dev hooks: open the duplicates window on a folder, optionally snapshot it to a PNG and quit
+    if let t = ProcessInfo.processInfo.environment["AUTOSCAN_DUPDIR"] {
+      dups.show(dir: t)
+      if let snap = ProcessInfo.processInfo.environment["AUTOSCAN_SNAPSHOT"] {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+          self.dups.win.appearance = NSAppearance(named: .aqua); let v = self.dups.win.contentView!
+          if let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) { v.cacheDisplay(in: v.bounds, to: rep); try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: snap)) }
+          if let d = v.value(forKey: "_subtreeDescription") as? String { try? d.write(toFile: snap + ".txt", atomically: true, encoding: .utf8) }
+          exit(0)
+        }
+      }
+    }
   }
   @objc func showWindow() { win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+  @objc func findDups() { dups.show(dir: dir) }
   @objc func quit() { exit(0) }
   func applicationShouldHandleReopen(_ a: NSApplication, hasVisibleWindows f: Bool) -> Bool { showWindow(); return true }
   func windowShouldClose(_ s: NSWindow) -> Bool { s.orderOut(nil); return false }
@@ -127,6 +142,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     let fmt = fmtPop.indexOfSelectedItem, q = jpegQualities[qPop.indexOfSelectedItem], dpi = dpis[dpiPop.indexOfSelectedItem]
     let crop = cropBox.state == .on, outDir = dir
     let name = raw.deletingPathExtension().lastPathComponent
+    statusLabel.stringValue = "Reading text..."
     DispatchQueue.global().async {
       var result: (String, String)?
       if let src = CGImageSourceCreateWithURL(raw as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) {
@@ -134,7 +150,15 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
         if crop, let c = autoCrop(img) { out = c.image; note = "cropped \(img.width)x\(img.height) -> \(out.width)x\(out.height)" }
         let ext = ["pdf", "jpg", "png", "tiff"][fmt]
         let dest = URL(fileURLWithPath: outDir).appendingPathComponent("\(name).\(ext)")
-        if encode(out, to: dest, format: fmt, quality: q, dpi: dpi) { result = (dest.path, note) }
+        let (page, upright) = analyzePage(out, crop: false)    // OCR on the lossless crop; keeps full text + boxes in the store
+        if encode(upright, to: dest, format: fmt, quality: q, dpi: dpi) {
+          result = (dest.path, note)
+          let rec = DocRec(sha: sha256(dest), ocrVersion: ocrVersion, created: Date().timeIntervalSince1970, pages: [page])
+          Store.shared.register(path: dest.path, rec: rec)
+          if let m = self.dups.engine.matches(for: dest.path, in: outDir).first {
+            notify("\(m.1.tier.label)?", "\((dest.path as NSString).lastPathComponent) looks like \((m.0.path as NSString).lastPathComponent) (\(m.1.reason)). Menu bar > Find Duplicates")
+          }
+        }
       }
       try? FileManager.default.removeItem(at: raw)
       DispatchQueue.main.async {
