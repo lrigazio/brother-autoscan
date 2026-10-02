@@ -1,5 +1,7 @@
 import Cocoa
 import ImageCaptureCore
+import PDFKit
+import UniformTypeIdentifiers
 
 let defaults = UserDefaults.standard
 func notify(_ title: String, _ body: String) {
@@ -11,13 +13,32 @@ func notify(_ title: String, _ body: String) {
 let formats: [(String, String)] = [("PDF", "com.adobe.pdf"), ("JPEG", "public.jpeg"), ("PNG", "public.png"), ("TIFF", "public.tiff")]
 let colors: [(String, ICScannerPixelDataType)] = [("Color", .RGB), ("Gray", .gray), ("Black & White", .BW)]
 let dpis = [150, 200, 300, 600]
+let jpegQualities = [70, 80, 90, 95, 100]
+let rawDir = NSTemporaryDirectory() + "autoscan-raw"
+
+func encode(_ img: CGImage, to url: URL, format: Int, quality: Int, dpi: Int) -> Bool {
+  if format == 0 {   // PDF: page size in points = pixels * 72 / dpi
+    let ns = NSImage(cgImage: img, size: NSSize(width: Double(img.width) * 72 / Double(dpi), height: Double(img.height) * 72 / Double(dpi)))
+    guard let page = PDFPage(image: ns) else { return false }
+    let doc = PDFDocument(); doc.insert(page, at: 0); return doc.write(to: url)
+  }
+  let type = [nil, UTType.jpeg, UTType.png, UTType.tiff][format]!
+  guard let d = CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, 1, nil) else { return false }
+  var props: [CFString: Any] = [kCGImagePropertyDPIWidth: dpi, kCGImagePropertyDPIHeight: dpi]
+  if format == 1 { props[kCGImageDestinationLossyCompressionQuality] = Double(quality) / 100 }
+  CGImageDestinationAddImage(d, img, props as CFDictionary)
+  return CGImageDestinationFinalize(d)
+}
 
 class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate,
            ICDeviceBrowserDelegate, ICScannerDeviceDelegate {
   var win: NSWindow!
   var folderLabel = NSTextField(labelWithString: "")
   var statusLabel = NSTextField(labelWithString: "Waiting for scanner...")
-  var dpiPop = NSPopUpButton(), fmtPop = NSPopUpButton(), colPop = NSPopUpButton()
+  var dpiPop = NSPopUpButton(), fmtPop = NSPopUpButton(), colPop = NSPopUpButton(), qPop = NSPopUpButton()
+  var cropBox = NSButton(checkboxWithTitle: "Auto-crop to content", target: nil, action: nil)
+  var thumb = NSImageView()
+  var seen = Set<String>()
   var table = NSTableView()
   var files: [String] = []
   var browser = ICDeviceBrowser()
@@ -53,15 +74,22 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     fmtPop.addItems(withTitles: formats.map { $0.0 }); fmtPop.selectItem(at: defaults.integer(forKey: "fmt")); v.addSubview(fmtPop)
     label("Color", 234); colPop.frame = NSRect(x: 96, y: 230, width: 130, height: 26)
     colPop.addItems(withTitles: colors.map { $0.0 }); colPop.selectItem(at: defaults.integer(forKey: "col")); v.addSubview(colPop)
-    for p in [dpiPop, fmtPop, colPop] { p.target = self; p.action = #selector(saveSettings) }
+    label("JPEG quality", 202); qPop.frame = NSRect(x: 96, y: 198, width: 100, height: 26)
+    qPop.addItems(withTitles: jpegQualities.map { "\($0)%" }); qPop.selectItem(at: jpegQualities.firstIndex(of: defaults.integer(forKey: "q")) ?? 2); v.addSubview(qPop)
+    cropBox.frame = NSRect(x: 250, y: 296, width: 200, height: 22); cropBox.state = defaults.object(forKey: "crop") == nil || defaults.bool(forKey: "crop") ? .on : .off; v.addSubview(cropBox)
+    thumb.frame = NSRect(x: 374, y: 164, width: 130, height: 126); thumb.imageScaling = .scaleProportionallyUpOrDown
+    thumb.wantsLayer = true; thumb.layer?.borderWidth = 1; thumb.layer?.borderColor = NSColor.separatorColor.cgColor; v.addSubview(thumb)
+    for p in [dpiPop, fmtPop, colPop, qPop] { p.target = self; p.action = #selector(saveSettings) }
+    cropBox.target = self; cropBox.action = #selector(saveSettings)
     let col = NSTableColumn(identifier: .init("f")); col.title = "Captured (double-click to reveal)"; col.width = 470
-    table.addTableColumn(col); table.dataSource = self; table.delegate = self; table.doubleAction = #selector(reveal); table.target = self
-    let sv = NSScrollView(frame: NSRect(x: 16, y: 16, width: 488, height: 200)); sv.documentView = table; sv.hasVerticalScroller = true; sv.borderType = .bezelBorder; v.addSubview(sv)
+    table.addTableColumn(col); table.dataSource = self; table.delegate = self; table.allowsEmptySelection = true; table.doubleAction = #selector(reveal); table.target = self
+    let sv = NSScrollView(frame: NSRect(x: 16, y: 16, width: 488, height: 140)); sv.documentView = table; sv.hasVerticalScroller = true; sv.borderType = .bezelBorder; v.addSubview(sv)
     folderLabel.stringValue = dir
     win.center()
   }
   @objc func saveSettings() {
     defaults.set(dpis[dpiPop.indexOfSelectedItem], forKey: "dpi"); defaults.set(fmtPop.indexOfSelectedItem, forKey: "fmt"); defaults.set(colPop.indexOfSelectedItem, forKey: "col")
+    defaults.set(jpegQualities[qPop.indexOfSelectedItem], forKey: "q"); defaults.set(cropBox.state == .on, forKey: "crop")
   }
   @objc func chooseDir() {
     let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.canCreateDirectories = true
@@ -70,13 +98,34 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     if p.runModal() == .OK, let u = p.url { dir = u.path; folderLabel.stringValue = dir }
   }
   @objc func reveal() { let r = table.clickedRow; if r >= 0 { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: files[r])]) } }
+  func tableViewSelectionDidChange(_ n: Notification) { let r = table.selectedRow; if r >= 0 { thumb.image = NSImage(contentsOfFile: files[r]) } }
   func numberOfRows(in t: NSTableView) -> Int { files.count }
   func tableView(_ t: NSTableView, objectValueFor c: NSTableColumn?, row: Int) -> Any? { files[row] }
-  func addFile(_ path: String) {
-    guard !files.contains(path) else { return }
-    files.insert(path, at: 0); table.reloadData()
-    statusLabel.stringValue = "Saved \(URL(fileURLWithPath: path).lastPathComponent)"
+  func addFile(_ path: String, note: String) {
+    files.insert(path, at: 0); table.reloadData(); thumb.image = NSImage(contentsOfFile: path)
+    statusLabel.stringValue = "Saved \(URL(fileURLWithPath: path).lastPathComponent) (\(note))"
     notify("Scan saved", path)
+  }
+  /// raw lossless scan -> crop -> encode final file
+  func process(raw: URL) {
+    guard seen.insert(raw.path).inserted else { return }
+    let fmt = fmtPop.indexOfSelectedItem, q = jpegQualities[qPop.indexOfSelectedItem], dpi = dpis[dpiPop.indexOfSelectedItem]
+    let crop = cropBox.state == .on, outDir = dir
+    let name = raw.deletingPathExtension().lastPathComponent
+    DispatchQueue.global().async {
+      var result: (String, String)?
+      if let src = CGImageSourceCreateWithURL(raw as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+        var out = img, note = "not cropped"
+        if crop, let c = autoCrop(img) { out = c.image; note = "cropped \(img.width)x\(img.height) -> \(out.width)x\(out.height)" }
+        let ext = ["pdf", "jpg", "png", "tiff"][fmt]
+        let dest = URL(fileURLWithPath: outDir).appendingPathComponent("\(name).\(ext)")
+        if encode(out, to: dest, format: fmt, quality: q, dpi: dpi) { result = (dest.path, note) }
+      }
+      try? FileManager.default.removeItem(at: raw)
+      DispatchQueue.main.async {
+        if let (p, n) = result { self.addFile(p, note: n) } else { self.statusLabel.stringValue = "Error: could not process scan" }
+      }
+    }
   }
 
   // MARK: scanner
@@ -109,14 +158,15 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     guard let s = scanner, let f = feeder, !scanning else { return }
     scanning = true
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(atPath: rawDir, withIntermediateDirectories: true)
     f.resolution = f.supportedResolutions.integerGreaterThanOrEqualTo(dpis[dpiPop.indexOfSelectedItem]) ?? 300
     f.pixelDataType = colors[colPop.indexOfSelectedItem].1
-    s.downloadsDirectory = URL(fileURLWithPath: dir); s.documentUTI = formats[fmtPop.indexOfSelectedItem].1
+    s.downloadsDirectory = URL(fileURLWithPath: rawDir); s.documentUTI = UTType.tiff.identifier   // lossless raw; encoded after cropping
     let d = DateFormatter(); d.dateFormat = "yyyyMMdd-HHmmss"; s.documentName = "scan-" + d.string(from: Date())
     s.requestScan()
   }
-  func scannerDevice(_ s: ICScannerDevice, didScanTo url: URL) { addFile(url.path) }
-  func scannerDevice(_ s: ICScannerDevice, didScanTo url: URL, data: Data?) { addFile(url.path) }
+  func scannerDevice(_ s: ICScannerDevice, didScanTo url: URL) { process(raw: url) }
+  func scannerDevice(_ s: ICScannerDevice, didScanTo url: URL, data: Data?) { process(raw: url) }
   func device(_ d: ICDevice, didEncounterError e: Error?) {
     if (e as NSError?)?.code == -9933 { emptyFeeder = true; return }
     statusLabel.stringValue = "Error: \(e?.localizedDescription ?? "unknown")"
