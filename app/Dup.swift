@@ -162,9 +162,23 @@ func rotated(_ img: CGImage, _ o: CGImagePropertyOrientation) -> CGImage {
   return ctx.makeImage() ?? img
 }
 
+private let moneyRE = try! NSRegularExpression(pattern: #"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?|\d+[.,]\d{2}(?!\d)"#)
+private let dateRE = try! NSRegularExpression(pattern: #"(?<![\d/.-])\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}(?![\d])"#)
+private let timeRE = try! NSRegularExpression(pattern: #"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)"#)
+
+/// Words and numbers, plus whole amounts ("$4266"), dates ("@3/21/25") and times ("~21:33"). Those carry
+/// the receipt's identity, unlike street numbers and phone digits that repeat on every receipt of a shop.
 func tokenize(_ s: String) -> [String] {
-  s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
-    .components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 2 }
+  let f = s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+  var out = f.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 2 }
+  let r = NSRange(f.startIndex..., in: f), ns = f as NSString
+  for m in moneyRE.matches(in: f, range: r) { out.append("$" + ns.substring(with: m.range).filter { $0.isNumber }) }
+  for m in dateRE.matches(in: f, range: r) {
+    let parts = ns.substring(with: m.range).components(separatedBy: CharacterSet(charactersIn: "/.-")).map { String(Int($0) ?? 0) }
+    out.append("@" + parts.joined(separator: "/"))
+  }
+  for m in timeRE.matches(in: f, range: r) { out.append("~" + ns.substring(with: m.range)) }
+  return out
 }
 
 /// OCR with orientation detection. Returns lines (upright-image coordinates) and the orientation that worked.
@@ -249,13 +263,23 @@ func comparePages(_ a: PageRec, _ ta: Set<String>, _ na: Set<String>, _ b: PageR
   if ta.count >= 8 && tb.count >= 8 {
     let mn = min(ta.count, tb.count), mx = max(ta.count, tb.count)
     let cont = Double(fuzzyIntersection(ta, tb)) / Double(mn), ratio = Double(mn) / Double(mx)
+    // Identity fields that clearly disagree mean two different receipts, however alike the template is.
+    let aA = na.filter { $0.hasPrefix("$") }, aB = nb.filter { $0.hasPrefix("$") }
+    let aMin = min(aA.count, aB.count)
+    // an amount "matches" if equal or one misread digit apart (OCR noise)
+    let (sm, lg) = aA.count <= aB.count ? (aA, aB) : (aB, aA)
+    let aMatch = sm.filter { x in lg.contains { y in x == y || oneSub(Array(x.utf8), Array(y.utf8)) } }.count
+    let amountsDiffer = aMin >= 1 && Double(aMatch) / Double(aMin) < 0.5
+    let dA = na.filter { $0.hasPrefix("@") }, dB = nb.filter { $0.hasPrefix("@") }
+    let datesDiffer = !dA.isEmpty && !dB.isEmpty && !dA.contains { x in dB.contains { y in x == y || oneSub(Array(x.utf8), Array(y.utf8)) } }
+    if amountsDiffer || datesDiffer { return nil }   // different receipt, however alike the template looks
     let nMin = min(na.count, nb.count)
     let nCont = nMin > 0 ? Double(fuzzyIntersection(na, nb)) / Double(nMin) : 1
     let textOK = cont >= 0.8 && (nMin >= 3 ? nCont >= 0.8 : (cont >= 0.9 && mn >= 25))
     let why = String(format: "text %.0f%%%@", cont * 100, nMin >= 3 ? String(format: ", numbers %.0f%%", nCont * 100) : "")
     if textOK { return ratio >= 0.5 ? Match(tier: .duplicate, score: cont, reason: why + (pd <= 8 ? ", same look" : ""))
                                     : Match(tier: .possible, score: cont, reason: why + " (one is a partial crop)") }
-    if pd <= 6 { return Match(tier: .possible, score: 0.5, reason: "looks the same but text differs") }
+    if pd <= 3 { return Match(tier: .possible, score: 0.5, reason: "looks the same but text differs") }
     if cont >= 0.7 && nMin >= 3 && nCont >= 0.6 { return Match(tier: .possible, score: cont, reason: why) }
     return nil
   }
