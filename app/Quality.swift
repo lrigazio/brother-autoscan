@@ -15,7 +15,7 @@ struct ScanQuality: Codable {
   var severity: Int          // 0 fine, 1 suspicious, 2 bad
   var reasons: [String]
 }
-let qualityVersion = 2
+let qualityVersion = 3
 
 private func barcodeBoxes(_ img: CGImage) -> [CGRect] {   // normalized, top-left origin
   let req = VNDetectBarcodesRequest()
@@ -63,12 +63,16 @@ func analyzeQuality(_ img: CGImage, rec: DocRec?) -> ScanQuality {
   var conf = 0.0, lines = 0
   if let p = rec?.pages.first, !p.lines.isEmpty { lines = p.lines.count; conf = p.lines.map { Double($0.conf) }.reduce(0, +) / Double(lines) }
 
+  // Vision reports lower confidence for CJK, Thai, Arabic... even when it reads them correctly, so confidence is only trusted for Latin text
+  let chars = (rec?.pages.first?.lines ?? []).flatMap { Array($0.text.unicodeScalars) }.filter { $0.properties.isAlphabetic }
+  let nonLatin = chars.isEmpty ? 0.0 : Double(chars.filter { $0.value >= 0x0590 }.count) / Double(chars.count)
+  let trustConf = nonLatin < 0.15
   var reasons = [String](), sev = 0
-  let poorText = rec != nil && lines < 12 && conf < 0.8          // OCR found little, or little that it trusts
+  let poorText = rec != nil && (trustConf ? (lines < 12 && conf < 0.8) : lines < 8)   // OCR found little, or little that it trusts
   if rec != nil && lines < 2 { reasons.append(inkFrac < 0.003 ? "blank page" : "no readable text (washed out, or content missing)"); sev = 2 }
   if poorText && streakFrac >= 0.15 { reasons.append(String(format: "smeared / stretched (%.0f%% of the text area) - feed glitch", streakFrac * 100)); sev = 2 }
   if poorText && unexplained >= 0.35 && inkFrac > 0.01 { reasons.append(String(format: "mangled or partial (%.0f%% of the ink is not readable text, %d lines read)", unexplained * 100, lines)); sev = 2 }
-  if sev == 0 && rec != nil && inkFrac > 0.03 && (lines < 3 || conf < 0.45) { reasons.append(String(format: "text barely readable (%d lines, %.0f%% confidence)", lines, conf * 100)); sev = 1 }
+  if sev == 0 && rec != nil && inkFrac > 0.03 && (lines < 3 || (trustConf && conf < 0.45)) { reasons.append(String(format: "text barely readable (%d lines, %.0f%% confidence)", lines, conf * 100)); sev = 1 }
   return ScanQuality(inkFrac: inkFrac, contrast: contrast, streakFrac: streakFrac, unexplained: unexplained, ocrConf: conf, ocrLines: lines, severity: sev, reasons: reasons)
 }
 
