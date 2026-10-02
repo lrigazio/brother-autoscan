@@ -89,9 +89,10 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   func splitView(_ s: NSSplitView, constrainMinCoordinate p: CGFloat, ofSubviewAt i: Int) -> CGFloat { 260 }
   func splitView(_ s: NSSplitView, constrainMaxCoordinate p: CGFloat, ofSubviewAt i: Int) -> CGFloat { 480 }
   func splitView(_ s: NSSplitView, canCollapseSubview v: NSView) -> Bool { false }
-  func windowShouldClose(_ s: NSWindow) -> Bool { s.orderOut(nil); return false }
+  func windowShouldClose(_ s: NSWindow) -> Bool { UserDefaults.standard.set(false, forKey: "dupsPending"); s.orderOut(nil); return false }
 
-  func show(dir: String) { self.dir = dir; win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); rescan() }
+  /// `dupsPending` survives a restart (macOS can relaunch the app right after the folder-access prompt), so the window comes back by itself.
+  func show(dir: String) { self.dir = dir; UserDefaults.standard.set(true, forKey: "dupsPending"); win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); rescan() }
   @objc func rescan() {
     guard !scanning else { return }
     scanning = true; status.stringValue = "Reading scans in \(dir)..."; progress.isHidden = false; progress.doubleValue = 0
@@ -101,6 +102,7 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
       let groups = self.engine.groups(docs)
       DispatchQueue.main.async {
         self.docs = docs; self.groups = groups; self.scanning = false; self.progress.isHidden = true
+        UserDefaults.standard.set(false, forKey: "dupsPending")
         self.remove = Set(groups.flatMap { self.suggested($0) })
         self.state = groups.map { self.initialState($0) }
         self.table.reloadData(); self.refreshCounts()

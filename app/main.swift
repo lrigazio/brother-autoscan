@@ -68,6 +68,10 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     browser.delegate = self
     browser.browsedDeviceTypeMask = ICDeviceTypeMask(rawValue: ICDeviceTypeMask.scanner.rawValue | ICDeviceLocationTypeMask.local.rawValue)!
     if ProcessInfo.processInfo.environment["AUTOSCAN_DUPDIR"] == nil { browser.start() }
+    // ask for folder access now (not in the middle of a duplicate scan), and resume a scan that a post-prompt restart interrupted
+    let scansDir = dir
+    DispatchQueue.global().async { _ = try? FileManager.default.contentsOfDirectory(atPath: scansDir) }
+    if UserDefaults.standard.bool(forKey: "dupsPending") { dups.show(dir: scansDir) }
     // dev hooks: open the duplicates window on a folder, optionally snapshot it to a PNG and quit
     if let t = ProcessInfo.processInfo.environment["AUTOSCAN_DUPDIR"] {
       dups.show(dir: t)
