@@ -1,6 +1,12 @@
 import Cocoa
 import PDFKit
 
+/// Window that lets the controller handle keys before AppKit does (arrow keys, space, ...).
+final class KeyWindow: NSWindow {
+  var onKey: ((NSEvent) -> Bool)?
+  override func sendEvent(_ e: NSEvent) { if e.type == .keyDown, onKey?(e) == true { return }; super.sendEvent(e) }
+}
+
 /// Review window. Left: scrollable list of duplicate groups. Right: the selected group, files side by side and large.
 final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSplitViewDelegate {
   let engine = DupEngine()
@@ -20,18 +26,25 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   var thumbs: [String: NSImage] = [:]
   var scanning = false
   var current = -1
+  var state: [Int] = []                 // per group: index of the file kept, or members.count = keep all, -1 = custom
+  var cards: [NSView] = []
+  var cbs: [Int: NSButton] = [:]
+  var badges: [Int: NSTextField] = [:]
+  let meta = NSTextField(wrappingLabelWithString: "")
+  let hint = NSTextField(labelWithString: "Left/Right or Space: cycle keep-left / keep-right / keep-all    Up/Down: group    Return: next group")
 
   override init() {
     super.init()
     let W: CGFloat = 1280, H: CGFloat = 840
-    win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H), styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+    win = KeyWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H), styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
     win.title = "AutoScan - Duplicates"; win.isReleasedWhenClosed = false; win.delegate = self; win.minSize = NSSize(width: 900, height: 600)
+    (win as! KeyWindow).onKey = { [weak self] e in self?.handleKey(e) ?? false }
     let v = win.contentView!
     status.frame = NSRect(x: 16, y: H - 34, width: 640, height: 20); status.autoresizingMask = [.maxXMargin, .minYMargin]; v.addSubview(status)
     progress.style = .bar; progress.isIndeterminate = false; progress.frame = NSRect(x: 16, y: H - 50, width: 320, height: 10); progress.autoresizingMask = [.maxXMargin, .minYMargin]; progress.isHidden = true; v.addSubview(progress)
     func btn(_ t: String, _ a: Selector, _ x: CGFloat) { let b = NSButton(title: t, target: self, action: a); b.frame = NSRect(x: W - x, y: H - 40, width: 130, height: 28); b.autoresizingMask = [.minXMargin, .minYMargin]; v.addSubview(b) }
     btn("Rescan", #selector(rescan), 290); btn("Select suggested", #selector(selectSuggested), 150)
-    trashBtn.target = self; trashBtn.action = #selector(trashSelected); trashBtn.bezelStyle = .rounded; trashBtn.keyEquivalent = "\r"
+    trashBtn.target = self; trashBtn.action = #selector(trashSelected); trashBtn.bezelStyle = .rounded
     trashBtn.frame = NSRect(x: W - 520, y: H - 74, width: 504, height: 30); trashBtn.autoresizingMask = [.minXMargin, .minYMargin]; v.addSubview(trashBtn)
 
     // left: groups
@@ -46,11 +59,15 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     cardsRow.translatesAutoresizingMaskIntoConstraints = false
     cardsScroll.documentView = cardsRow; cardsScroll.hasHorizontalScroller = true; cardsScroll.autohidesScrollers = true; cardsScroll.drawsBackground = false
     groupBtn.target = self; groupBtn.action = #selector(trashGroup); groupBtn.bezelStyle = .rounded
-    for s in [header, cardsScroll, groupBtn] as [NSView] { s.translatesAutoresizingMaskIntoConstraints = false; right.addSubview(s) }
+    hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor; hint.lineBreakMode = .byTruncatingTail
+    hint.frame = NSRect(x: 16, y: H - 70, width: 760, height: 16); hint.autoresizingMask = [.maxXMargin, .minYMargin]; v.addSubview(hint)
+    meta.font = .monospacedSystemFont(ofSize: 10, weight: .regular); meta.textColor = .secondaryLabelColor; meta.maximumNumberOfLines = 9; meta.lineBreakMode = .byTruncatingTail
+    for s in [header, cardsScroll, groupBtn, meta] as [NSView] { s.translatesAutoresizingMaskIntoConstraints = false; right.addSubview(s) }
     NSLayoutConstraint.activate([
       header.topAnchor.constraint(equalTo: right.topAnchor, constant: 12), header.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 16), header.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -16),
       cardsScroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 10), cardsScroll.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 16), cardsScroll.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -16),
-      cardsScroll.bottomAnchor.constraint(equalTo: groupBtn.topAnchor, constant: -10),
+      cardsScroll.bottomAnchor.constraint(equalTo: meta.topAnchor, constant: -8),
+      meta.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 16), meta.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -16), meta.bottomAnchor.constraint(equalTo: groupBtn.topAnchor, constant: -8),
       groupBtn.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -16), groupBtn.bottomAnchor.constraint(equalTo: right.bottomAnchor, constant: -12),
       cardsRow.topAnchor.constraint(equalTo: cardsScroll.contentView.topAnchor), cardsRow.bottomAnchor.constraint(equalTo: cardsScroll.contentView.bottomAnchor),
       cardsRow.leadingAnchor.constraint(equalTo: cardsScroll.contentView.leadingAnchor),
@@ -79,6 +96,7 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
       DispatchQueue.main.async {
         self.docs = docs; self.groups = groups; self.scanning = false; self.progress.isHidden = true
         self.remove = Set(groups.flatMap { self.suggested($0) })
+        self.state = groups.map { self.initialState($0) }
         self.table.reloadData(); self.refreshCounts()
         let keep = min(max(self.current, 0), groups.count - 1)
         if groups.isEmpty { self.current = -1; self.showGroup(-1) } else { self.table.selectRowIndexes([keep], byExtendingSelection: false); self.showGroup(keep) }
@@ -102,22 +120,96 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   }
   @objc func toggle(_ b: NSButton) {
     if b.state == .on { remove.insert(b.identifier!.rawValue) } else { remove.remove(b.identifier!.rawValue) }
-    refreshCounts(); reloadRow(current); updateGroupButton()
+    if current >= 0 && current < state.count { state[current] = -1 }
+    refreshCounts(); reloadRow(current); refreshCards()
+  }
+  func initialState(_ g: DupGroup) -> Int {
+    let sg = suggested(g)
+    if sg.isEmpty { return g.members.count }
+    return sg.count == g.members.count - 1 ? g.keeper : -1
+  }
+  /// Cycle the current group through: keep file 0, keep file 1, ..., keep all, then back to the start.
+  func step(_ d: Int) {
+    guard current >= 0, current < groups.count else { return }
+    let n = groups[current].members.count + 1
+    let s = state[current] < 0 ? (d > 0 ? 0 : n - 1) : ((state[current] + d) % n + n) % n
+    apply(current, s)
+  }
+  func apply(_ gi: Int, _ s: Int) {
+    var g = groups[gi]; let paths = g.members.map { $0.path }
+    remove.subtract(paths)
+    if s < g.members.count {
+      g.keeper = s
+      g.links = g.members.enumerated().map { $0.offset == s ? nil : compare(g.members[s], $0.element) }
+      for (i, p) in paths.enumerated() where i != s { remove.insert(p) }
+    }
+    groups[gi] = g; state[gi] = s
+    refreshCounts(); reloadRow(gi); refreshCards()
+  }
+  func moveGroup(_ d: Int) {
+    guard !groups.isEmpty else { return }
+    let i = min(max(current + d, 0), groups.count - 1)
+    table.selectRowIndexes([i], byExtendingSelection: false); table.scrollRowToVisible(i)
+  }
+  /// Keyboard: Left/Right/Space cycle the keep state, Up/Down change group, Return = next group.
+  func handleKey(_ e: NSEvent) -> Bool {
+    guard win.isKeyWindow, !e.modifierFlags.contains(.command), !e.modifierFlags.contains(.control), !e.modifierFlags.contains(.option) else { return false }
+    switch e.keyCode {
+    case 123: step(-1)
+    case 124, 49: step(1)
+    case 125, 36, 76: moveGroup(1)
+    case 126: moveGroup(-1)
+    default: return false
+    }
+    return true
+  }
+  func stateName(_ g: DupGroup, _ s: Int) -> String {
+    if s == g.members.count { return "keeping all files" }
+    if s < 0 { return "custom selection" }
+    return "keeping \(s + 1) of \(g.members.count): \((g.members[s].path as NSString).lastPathComponent)"
+  }
+  /// Badges, borders and metadata follow what is selected for the Trash.
+  func refreshCards() {
+    guard current >= 0, current < groups.count else { return }
+    let g = groups[current]
+    for (i, c) in cards.enumerated() where i < g.members.count {
+      let kept = !remove.contains(g.members[i].path)
+      badges[i]?.stringValue = kept ? "KEEP" : "TRASH"; badges[i]?.textColor = kept ? .systemGreen : .systemRed
+      cbs[i]?.state = kept ? .off : .on
+      c.wantsLayer = true; c.layer?.cornerRadius = 8; c.layer?.borderWidth = 3
+      let col = kept ? NSColor.systemGreen : NSColor.systemRed
+      c.layer?.borderColor = col.cgColor
+    }
+    header.stringValue = "\(g.tier.label) - \(g.members.count) files - \(g.reason)   |   \(stateName(g, state[current]))"
+    updateGroupButton(); updateMeta()
+  }
+  /// Small-print details of the file(s) being kept: file facts plus what the stored OCR saw.
+  func updateMeta() {
+    guard current >= 0, current < groups.count else { meta.stringValue = ""; return }
+    let g = groups[current]
+    let kept = g.members.filter { !remove.contains($0.path) }
+    let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
+    var out = [String]()
+    for m in kept.prefix(2) {
+      let p = m.rec.pages[0], lines = p.lines.map { $0.text }
+      let conf = p.lines.isEmpty ? 0 : Int(p.lines.map { Double($0.conf) }.reduce(0, +) / Double(p.lines.count) * 100)
+      let amounts = lines.filter { let l = $0.lowercased(); return l.contains("total") || l.contains("tip") || l.contains("amount") }.prefix(3)
+      out.append("KEEP  \(m.path)")
+      out.append("      \(p.w)x\(p.h) px  \(ByteCountFormatter.string(fromByteCount: Int64(m.size), countStyle: .file))  \((m.path as NSString).pathExtension.lowercased())  \(m.rec.pages.count) page(s)  \(df.string(from: Date(timeIntervalSince1970: m.mtime)))  sha \(m.rec.sha.prefix(10))")
+      out.append("      OCR: \(lines.count) lines, avg confidence \(conf)%   \(lines.prefix(3).joined(separator: " | "))")
+      if !amounts.isEmpty { out.append("      amounts: \(amounts.joined(separator: " | "))") }
+    }
+    if kept.count > 2 { out.append("      (+\(kept.count - 2) more kept)") }
+    if kept.isEmpty { out.append("Nothing kept in this group - every file is selected for the Trash.") }
+    meta.stringValue = out.joined(separator: "\n")
   }
   func reloadRow(_ i: Int) {
     guard i >= 0 && i < groups.count else { return }
     table.reloadData(forRowIndexes: [i], columnIndexes: [0]); table.selectRowIndexes([i], byExtendingSelection: false)
   }
   @objc func keepThis(_ b: NSButton) {
-    let gi = current
-    guard gi >= 0, gi < groups.count, let mi = groups[gi].members.firstIndex(where: { $0.path == b.identifier?.rawValue }) else { return }
-    var g = groups[gi]
-    for p in suggested(g) { remove.remove(p) }
-    let k = g.members[mi]; g.members.remove(at: mi); g.members.insert(k, at: 0); g.keeper = 0
-    g.links = g.members.enumerated().map { $0.offset == 0 ? nil : compare(k, $0.element) }
-    groups[gi] = g
-    if g.tier >= .duplicate { for p in suggested(g) { remove.insert(p) } }
-    refreshCounts(); reloadRow(gi); showGroup(gi)
+    guard current >= 0, current < groups.count, let mi = groups[current].members.firstIndex(where: { $0.path == b.identifier?.rawValue }) else { return }
+    apply(current, mi)
   }
   @objc func open(_ g: NSClickGestureRecognizer) { if let p = g.view?.identifier?.rawValue { NSWorkspace.shared.open(URL(fileURLWithPath: p)) } }
 
@@ -178,14 +270,14 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   func showGroup(_ i: Int) {
     current = i
     cardsRow.arrangedSubviews.forEach { cardsRow.removeArrangedSubview($0); $0.removeFromSuperview() }
+    cards = []; cbs = [:]; badges = [:]
     guard i >= 0, i < groups.count else { header.stringValue = "No duplicates to review."; header.textColor = .labelColor; groupBtn.isHidden = true; return }
     groupBtn.isHidden = false; updateGroupButton()
     let g = groups[i]
-    header.stringValue = "\(g.tier.label) - \(g.members.count) files - \(g.reason)"
     header.textColor = tierColor(g.tier)
     let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
     for (mi, m) in g.members.enumerated() {
-      let card = NSStackView(); card.orientation = .vertical; card.alignment = .leading; card.spacing = 5
+      let card = NSStackView(); card.orientation = .vertical; card.alignment = .leading; card.spacing = 5; card.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
       card.translatesAutoresizingMaskIntoConstraints = false
       card.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
       let iv = NSImageView(); iv.imageScaling = .scaleProportionallyUpOrDown; iv.imageAlignment = .alignTop; iv.wantsLayer = true
@@ -208,18 +300,15 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
       let p = m.rec.pages[0]
       line((m.path as NSString).lastPathComponent, bold: true, size: 13)
       line("\(p.w)x\(p.h)\(m.rec.pages.count > 1 ? " - \(m.rec.pages.count) pages" : "") - \(ByteCountFormatter.string(fromByteCount: Int64(m.size), countStyle: .file)) - \(df.string(from: Date(timeIntervalSince1970: m.mtime)))", size: 11, color: .secondaryLabelColor)
-      if mi == g.keeper {
-        line("KEEP", bold: true, color: .systemGreen)
-      } else {
-        line(g.links[mi].map { "\($0.tier.label): \($0.reason)" } ?? "linked via another copy, not a direct match", size: 11, color: .secondaryLabelColor, lines: 2)
-        let cb = NSButton(checkboxWithTitle: "Move to Trash", target: self, action: #selector(toggle(_:)))
-        cb.identifier = NSUserInterfaceItemIdentifier(m.path); cb.state = remove.contains(m.path) ? .on : .off
-        cb.setContentHuggingPriority(.required, for: .vertical); card.addArrangedSubview(cb)
-        let kb = NSButton(title: "Keep this one instead", target: self, action: #selector(keepThis(_:))); kb.controlSize = .small
-        kb.identifier = NSUserInterfaceItemIdentifier(m.path); kb.setContentHuggingPriority(.required, for: .vertical); card.addArrangedSubview(kb)
-      }
-      cardsRow.addArrangedSubview(card)
+      if mi != g.keeper { line(g.links[mi].map { "\($0.tier.label): \($0.reason)" } ?? "linked via another copy, not a direct match", size: 11, color: .secondaryLabelColor, lines: 2) }
+      let badge = NSTextField(labelWithString: "KEEP"); badge.font = .boldSystemFont(ofSize: 13); badges[mi] = badge; card.addArrangedSubview(badge)
+      let cb = NSButton(checkboxWithTitle: "Move to Trash", target: self, action: #selector(toggle(_:)))
+      cb.identifier = NSUserInterfaceItemIdentifier(m.path); cb.setContentHuggingPriority(.required, for: .vertical); cbs[mi] = cb; card.addArrangedSubview(cb)
+      let kb = NSButton(title: "Keep only this one", target: self, action: #selector(keepThis(_:))); kb.controlSize = .small
+      kb.identifier = NSUserInterfaceItemIdentifier(m.path); kb.setContentHuggingPriority(.required, for: .vertical); card.addArrangedSubview(kb)
+      cardsRow.addArrangedSubview(card); cards.append(card)
       card.heightAnchor.constraint(equalTo: cardsRow.heightAnchor).isActive = true
     }
+    refreshCards()
   }
 }
