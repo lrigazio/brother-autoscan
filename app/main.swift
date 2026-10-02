@@ -39,6 +39,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
   var cropBox = NSButton(checkboxWithTitle: "Auto-crop to content", target: nil, action: nil)
   var thumb = NSImageView()
   var seen = Set<String>()
+  var qLabel = NSTextField()
   var table = NSTableView()
   var files: [String] = []
   var browser = ICDeviceBrowser()
@@ -63,7 +64,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 400), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
     win.title = "AutoScan - Brother DS-640"; win.delegate = self; win.isReleasedWhenClosed = false
     let v = win.contentView!
-    func label(_ s: String, _ y: CGFloat) { let l = NSTextField(labelWithString: s); l.frame = NSRect(x: 16, y: y, width: 80, height: 20); v.addSubview(l) }
+    @discardableResult func label(_ s: String, _ y: CGFloat) -> NSTextField { let l = NSTextField(labelWithString: s); l.frame = NSRect(x: 16, y: y, width: 80, height: 20); v.addSubview(l); return l }
     statusLabel.frame = NSRect(x: 16, y: 364, width: 488, height: 20); statusLabel.font = .boldSystemFont(ofSize: 13); v.addSubview(statusLabel)
     label("Folder", 332)
     folderLabel.frame = NSRect(x: 96, y: 332, width: 310, height: 20); folderLabel.lineBreakMode = .byTruncatingHead; v.addSubview(folderLabel)
@@ -74,20 +75,22 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     fmtPop.addItems(withTitles: formats.map { $0.0 }); fmtPop.selectItem(at: defaults.integer(forKey: "fmt")); v.addSubview(fmtPop)
     label("Color", 234); colPop.frame = NSRect(x: 96, y: 230, width: 130, height: 26)
     colPop.addItems(withTitles: colors.map { $0.0 }); colPop.selectItem(at: defaults.integer(forKey: "col")); v.addSubview(colPop)
-    label("JPEG quality", 202); qPop.frame = NSRect(x: 96, y: 198, width: 100, height: 26)
+    qLabel = label("JPEG quality", 202); qPop.frame = NSRect(x: 96, y: 198, width: 100, height: 26)
     qPop.addItems(withTitles: jpegQualities.map { "\($0)%" }); qPop.selectItem(at: jpegQualities.firstIndex(of: defaults.integer(forKey: "q")) ?? 2); v.addSubview(qPop)
     cropBox.frame = NSRect(x: 250, y: 296, width: 200, height: 22); cropBox.state = defaults.object(forKey: "crop") == nil || defaults.bool(forKey: "crop") ? .on : .off; v.addSubview(cropBox)
     thumb.frame = NSRect(x: 374, y: 164, width: 130, height: 126); thumb.imageScaling = .scaleProportionallyUpOrDown
     thumb.wantsLayer = true; thumb.layer?.borderWidth = 1; thumb.layer?.borderColor = NSColor.separatorColor.cgColor; v.addSubview(thumb)
     for p in [dpiPop, fmtPop, colPop, qPop] { p.target = self; p.action = #selector(saveSettings) }
-    cropBox.target = self; cropBox.action = #selector(saveSettings)
+    cropBox.target = self; cropBox.action = #selector(saveSettings); updateQuality()
     let col = NSTableColumn(identifier: .init("f")); col.title = "Captured (double-click to reveal)"; col.width = 470
     table.addTableColumn(col); table.dataSource = self; table.delegate = self; table.allowsEmptySelection = true; table.doubleAction = #selector(reveal); table.target = self
     let sv = NSScrollView(frame: NSRect(x: 16, y: 16, width: 488, height: 140)); sv.documentView = table; sv.hasVerticalScroller = true; sv.borderType = .bezelBorder; v.addSubview(sv)
     folderLabel.stringValue = dir
     win.center()
   }
+  func updateQuality() { let j = fmtPop.indexOfSelectedItem == 1; qPop.isHidden = !j; qLabel.isHidden = !j }
   @objc func saveSettings() {
+    updateQuality()
     defaults.set(dpis[dpiPop.indexOfSelectedItem], forKey: "dpi"); defaults.set(fmtPop.indexOfSelectedItem, forKey: "fmt"); defaults.set(colPop.indexOfSelectedItem, forKey: "col")
     defaults.set(jpegQualities[qPop.indexOfSelectedItem], forKey: "q"); defaults.set(cropBox.state == .on, forKey: "crop")
   }
