@@ -46,6 +46,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
   var scanner: ICScannerDevice?, feeder: ICScannerFunctionalUnitDocumentFeeder?
   var scanning = false, emptyFeeder = false
   var poll: Timer?
+  var statusItem: NSStatusItem!
 
   var dir: String {
     get { defaults.string(forKey: "dir") ?? NSString("~/Documents/Scans").expandingTildeInPath }
@@ -54,10 +55,21 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
 
   func applicationDidFinishLaunching(_ n: Notification) {
     buildWindow()
+    statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    statusItem.button?.image = NSImage(systemSymbolName: "scanner", accessibilityDescription: "AutoScan") ?? NSImage(systemSymbolName: "doc.viewfinder", accessibilityDescription: "AutoScan")
+    let m = NSMenu()
+    m.addItem(NSMenuItem(title: "Show AutoScan Window", action: #selector(showWindow), keyEquivalent: ""))
+    m.addItem(.separator())
+    m.addItem(NSMenuItem(title: "Quit AutoScan", action: #selector(quit), keyEquivalent: "q"))
+    for i in m.items { i.target = self }
+    statusItem.menu = m
     browser.delegate = self
     browser.browsedDeviceTypeMask = ICDeviceTypeMask(rawValue: ICDeviceTypeMask.scanner.rawValue | ICDeviceLocationTypeMask.local.rawValue)!
     browser.start()
   }
+  @objc func showWindow() { win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+  @objc func quit() { exit(0) }
+  func applicationShouldHandleReopen(_ a: NSApplication, hasVisibleWindows f: Bool) -> Bool { showWindow(); return true }
   func windowShouldClose(_ s: NSWindow) -> Bool { s.orderOut(nil); return false }
 
   func buildWindow() {

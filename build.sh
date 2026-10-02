@@ -9,5 +9,5 @@ swiftc -O app/main.swift app/Crop.swift -o $A/Contents/MacOS/AutoScan
 codesign --force --sign - $A
 sed "s|/Users/luca|$HOME|g" com.luca.autoscan.plist > ~/Library/LaunchAgents/com.luca.autoscan.plist
 launchctl bootout gui/$(id -u)/com.luca.autoscan 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.luca.autoscan.plist
+sleep 2; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.luca.autoscan.plist
 echo "Installed. Plug in the scanner."
