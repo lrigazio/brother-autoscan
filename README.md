@@ -24,3 +24,6 @@ The DS-640 exposes only vendor-specific USB interfaces, but Brother's ICA driver
 ## Gotchas
 - ICA error -47 "busy": another app holds the scanner.
 - `documentLoaded` is always true. An empty feeder returns ICA error -9933, which the app treats as "keep waiting".
+
+## License
+MIT - see [LICENSE](LICENSE).
