@@ -61,7 +61,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     statusItem.button?.image = NSImage(systemSymbolName: "scanner", accessibilityDescription: "AutoScan") ?? NSImage(systemSymbolName: "doc.viewfinder", accessibilityDescription: "AutoScan")
     let m = NSMenu()
     m.addItem(NSMenuItem(title: "Show AutoScan Window", action: #selector(showWindow), keyEquivalent: ""))
-    m.addItem(NSMenuItem(title: "Find Duplicates...", action: #selector(findDups), keyEquivalent: "d"))
+    m.addItem(NSMenuItem(title: "Cleanup...", action: #selector(findDups), keyEquivalent: "d"))
     m.addItem(.separator())
     m.addItem(NSMenuItem(title: "Quit AutoScan", action: #selector(quit), keyEquivalent: "q"))
     for i in m.items { i.target = self }
@@ -172,8 +172,11 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
           result = (dest.path, note)
           let rec = DocRec(sha: sha256(dest), ocrVersion: ocrVersion, created: Date().timeIntervalSince1970, pages: [page])
           Store.shared.register(path: dest.path, rec: rec)
-          if let m = self.dups.engine.matches(for: dest.path, in: outDir).first {
-            notify("\(m.1.tier.label)?", "\((dest.path as NSString).lastPathComponent) looks like \((m.0.path as NSString).lastPathComponent) (\(m.1.reason)). Menu bar > Find Duplicates")
+          let q = analyzeQuality(upright, rec: rec); Store.shared.saveQuality(q, rec.sha)
+          if q.severity >= 1 {   // a bad scan is reported on its own and never matched against others
+            notify(q.severity == 2 ? "Bad scan" : "Check this scan", "\((dest.path as NSString).lastPathComponent): \(q.reasons.first ?? "poor quality"). Menu bar > Cleanup")
+          } else if let m = self.dups.engine.matches(for: dest.path, in: outDir).first {
+            notify("\(m.1.tier.label)?", "\((dest.path as NSString).lastPathComponent) looks like \((m.0.path as NSString).lastPathComponent) (\(m.1.reason)). Menu bar > Cleanup")
           }
         }
       }

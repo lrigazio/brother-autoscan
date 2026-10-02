@@ -13,7 +13,9 @@ final class KeyWindow: NSWindow {
   override func sendEvent(_ e: NSEvent) { if e.type == .keyDown, onKey?(e) == true { return }; super.sendEvent(e) }
 }
 
-/// Review window. Left: scrollable list of duplicate groups. Right: the selected group, files side by side and large.
+struct BadItem { let doc: Doc; let q: ScanQuality }
+
+/// Cleanup window: bad scans first, then duplicates. Left: scrollable list of duplicate groups. Right: the selected group, files side by side and large.
 final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSplitViewDelegate {
   let engine = DupEngine()
   var win: NSWindow!
@@ -28,6 +30,9 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   var dir = ""
   var docs: [Doc] = []
   var groups: [DupGroup] = []
+  var bad: [BadItem] = []               // bad / suspicious scans (kept out of duplicate matching)
+  var mode = 0                          // 0 = bad scans, 1 = duplicates
+  let modeSeg = NSSegmentedControl(labels: ["Bad scans", "Duplicates"], trackingMode: .selectOne, target: nil, action: nil)
   var remove = Set<String>()            // paths currently selected for the Trash
   var thumbs: [String: NSImage] = [:]
   var scanning = false
@@ -43,15 +48,17 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     super.init()
     let W: CGFloat = 1280, H: CGFloat = 840
     win = KeyWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H), styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
-    win.title = "AutoScan - Duplicates"; win.isReleasedWhenClosed = false; win.delegate = self; win.minSize = NSSize(width: 900, height: 600)
+    win.title = "AutoScan - Cleanup"; win.isReleasedWhenClosed = false; win.delegate = self; win.minSize = NSSize(width: 900, height: 600)
     (win as! KeyWindow).onKey = { [weak self] e in self?.handleKey(e) ?? false }
     let v = win.contentView!
     status.frame = NSRect(x: 16, y: H - 34, width: 640, height: 20); status.autoresizingMask = [.maxXMargin, .minYMargin]; v.addSubview(status)
+    modeSeg.target = self; modeSeg.action = #selector(modeChanged); modeSeg.selectedSegment = 0; modeSeg.segmentStyle = .rounded
+    modeSeg.frame = NSRect(x: 16, y: H - 76, width: 330, height: 24); modeSeg.autoresizingMask = [.maxXMargin, .minYMargin]; v.addSubview(modeSeg)
     progress.style = .bar; progress.isIndeterminate = false; progress.frame = NSRect(x: 16, y: H - 50, width: 320, height: 10); progress.autoresizingMask = [.maxXMargin, .minYMargin]; progress.isHidden = true; v.addSubview(progress)
     func btn(_ t: String, _ a: Selector, _ x: CGFloat) { let b = NSButton(title: t, target: self, action: a); b.frame = NSRect(x: W - x, y: H - 40, width: 130, height: 28); b.autoresizingMask = [.minXMargin, .minYMargin]; v.addSubview(b) }
     btn("Rescan", #selector(rescan), 290); btn("Select suggested", #selector(selectSuggested), 150)
     trashBtn.target = self; trashBtn.action = #selector(trashSelected); trashBtn.bezelStyle = .rounded
-    trashBtn.frame = NSRect(x: W - 520, y: H - 74, width: 504, height: 30); trashBtn.autoresizingMask = [.minXMargin, .minYMargin]; v.addSubview(trashBtn)
+    trashBtn.frame = NSRect(x: W - 420, y: H - 76, width: 404, height: 30); trashBtn.autoresizingMask = [.minXMargin, .minYMargin]; v.addSubview(trashBtn)
 
     // left: groups
     let col = NSTableColumn(identifier: .init("g")); col.resizingMask = .autoresizingMask
@@ -65,8 +72,8 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     cardsRow.translatesAutoresizingMaskIntoConstraints = false
     cardsScroll.documentView = cardsRow; cardsScroll.hasHorizontalScroller = true; cardsScroll.autohidesScrollers = true; cardsScroll.drawsBackground = false
     groupBtn.target = self; groupBtn.action = #selector(trashGroup); groupBtn.bezelStyle = .rounded
-    hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor; hint.lineBreakMode = .byTruncatingTail
-    hint.frame = NSRect(x: 16, y: H - 70, width: 760, height: 16); hint.autoresizingMask = [.maxXMargin, .minYMargin]; v.addSubview(hint)
+    hint.font = .systemFont(ofSize: 10.5); hint.textColor = .secondaryLabelColor; hint.lineBreakMode = .byTruncatingTail
+    hint.frame = NSRect(x: 360, y: H - 72, width: 480, height: 16); hint.autoresizingMask = [.maxXMargin, .minYMargin]; v.addSubview(hint)
     meta.font = .monospacedSystemFont(ofSize: 10, weight: .regular); meta.textColor = .secondaryLabelColor; meta.maximumNumberOfLines = 9; meta.lineBreakMode = .byTruncatingTail
     for s in [header, cardsScroll, groupBtn, meta] as [NSView] { s.translatesAutoresizingMaskIntoConstraints = false; right.addSubview(s) }
     NSLayoutConstraint.activate([
@@ -99,32 +106,54 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     let d = dir
     DispatchQueue.global().async {
       let docs = self.engine.docs(in: d) { done, total in DispatchQueue.main.async { self.progress.maxValue = Double(total); self.progress.doubleValue = Double(done); self.status.stringValue = "Reading text from scans: \(done)/\(total)" } }
-      let groups = self.engine.groups(docs)
+      DispatchQueue.main.async { self.status.stringValue = "Checking scan quality..." }
+      let quality = self.engine.qualities(docs)
+      let bad = docs.compactMap { d in quality[d.path].flatMap { $0.severity >= 1 ? BadItem(doc: d, q: $0) : nil } }
+        .sorted { ($0.q.severity, $1.doc.path) > ($1.q.severity, $0.doc.path) }
+      let dupDocs = docs.filter { (quality[$0.path]?.severity ?? 0) < 2 }      // bad scans are never matched against anything
+      let groups = self.engine.groups(dupDocs)
       DispatchQueue.main.async {
-        self.docs = docs; self.groups = groups; self.scanning = false; self.progress.isHidden = true
+        self.docs = docs; self.groups = groups; self.bad = bad; self.scanning = false; self.progress.isHidden = true
         UserDefaults.standard.set(false, forKey: "dupsPending")
-        self.remove = Set(groups.flatMap { self.suggested($0) })
+        self.remove = Set(groups.flatMap { self.suggested($0) }).union(bad.filter { $0.q.severity == 2 }.map { $0.doc.path })
         self.state = groups.map { self.initialState($0) }
+        if self.firstLoad { self.mode = bad.isEmpty ? 1 : 0; self.firstLoad = false }
+        if self.mode == 0 && bad.isEmpty && !groups.isEmpty { self.mode = 1 } else if self.mode == 1 && groups.isEmpty && !bad.isEmpty { self.mode = 0 }
+        self.modeSeg.selectedSegment = self.mode; self.updateSegLabels(); self.updateHint()
         self.table.reloadData(); self.refreshCounts()
-        let keep = min(max(self.current, 0), groups.count - 1)
-        if groups.isEmpty { self.current = -1; self.showGroup(-1) } else { self.table.selectRowIndexes([keep], byExtendingSelection: false); self.showGroup(keep) }
+        let n = self.rowCount, keep = min(max(self.current, 0), n - 1)
+        if n == 0 { self.current = -1; self.showCurrent(-1) } else { self.table.selectRowIndexes([keep], byExtendingSelection: false); self.showCurrent(keep) }
       }
     }
   }
+  var firstLoad = true
+  var rowCount: Int { mode == 0 ? bad.count : groups.count }
+  func updateSegLabels() { modeSeg.setLabel("Bad scans (\(bad.count))", forSegment: 0); modeSeg.setLabel("Duplicates (\(groups.count))", forSegment: 1) }
+  func updateHint() {
+    hint.stringValue = mode == 0 ? "Space or \u{2190}/\u{2192}: keep / trash    \u{2191}/\u{2193}: next scan    Tab: Duplicates"
+                                 : "\u{2190}/\u{2192} or Space: keep-left / keep-right / keep-all    \u{2191}/\u{2193}: group    Tab: Bad scans"
+  }
+  @objc func modeChanged() {
+    mode = modeSeg.selectedSegment; current = -1; updateHint(); table.reloadData()
+    if rowCount == 0 { showCurrent(-1) } else { table.selectRowIndexes([0], byExtendingSelection: false); showCurrent(0) }
+    refreshCounts()
+  }
+  func showCurrent(_ i: Int) { if mode == 0 { showBad(i) } else { showGroup(i) } }
 
   // MARK: selection
   func suggested(_ g: DupGroup) -> [String] {
     guard g.tier >= .duplicate else { return [] }
     return g.members.indices.filter { $0 != g.keeper && (g.links[$0]?.tier ?? .possible) >= .duplicate }.map { g.members[$0].path }
   }
-  @objc func selectSuggested() { remove = Set(groups.flatMap { suggested($0) }); table.reloadData(); refreshCounts(); showGroup(current) }
+  @objc func selectSuggested() { remove = Set(groups.flatMap { suggested($0) }).union(bad.filter { $0.q.severity == 2 }.map { $0.doc.path }); table.reloadData(); refreshCounts(); showCurrent(current) }
   func size(_ paths: Set<String>) -> Int { docs.filter { paths.contains($0.path) }.reduce(0) { $0 + $1.size } }
   func refreshCounts() {
     let n = remove.count
     trashBtn.title = n == 0 ? "Nothing selected" : "Move \(n) selected file\(n == 1 ? "" : "s") to Trash (\(ByteCountFormatter.string(fromByteCount: Int64(size(remove)), countStyle: .file)))..."
     trashBtn.isEnabled = n > 0
     let dupGroups = groups.filter { $0.tier >= .duplicate }.count, poss = groups.count - dupGroups
-    status.stringValue = groups.isEmpty ? "No duplicates found in \(docs.count) files." : "\(dupGroups) duplicate group\(dupGroups == 1 ? "" : "s"), \(poss) possible - \(docs.count) files scanned"
+    let badN = bad.filter { $0.q.severity == 2 }.count
+    status.stringValue = (bad.isEmpty && groups.isEmpty) ? "Nothing to clean up in \(docs.count) files." : "\(badN) bad scan\(badN == 1 ? "" : "s"), \(bad.count - badN) to check; \(dupGroups) duplicate group\(dupGroups == 1 ? "" : "s"), \(poss) possible - \(docs.count) files scanned"
   }
   @objc func toggle(_ b: NSButton) {
     if b.state == .on { remove.insert(b.identifier!.rawValue) } else { remove.remove(b.identifier!.rawValue) }
@@ -155,14 +184,16 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     refreshCounts(); reloadRow(gi); refreshCards()
   }
   func moveGroup(_ d: Int) {
-    guard !groups.isEmpty else { return }
-    let i = min(max(current + d, 0), groups.count - 1)
+    guard rowCount > 0 else { return }
+    let i = min(max(current + d, 0), rowCount - 1)
     table.selectRowIndexes([i], byExtendingSelection: false); table.scrollRowToVisible(i)
   }
   /// Keyboard: Left/Right/Space cycle the keep state, Up/Down change group, Return = next group.
   func handleKey(_ e: NSEvent) -> Bool {
     guard win.isKeyWindow, !e.modifierFlags.contains(.command), !e.modifierFlags.contains(.control), !e.modifierFlags.contains(.option) else { return false }
     switch e.keyCode {
+    case 48: modeSeg.selectedSegment = 1 - mode; modeChanged()
+    case 123 where mode == 0, 124 where mode == 0, 49 where mode == 0: toggleBad()
     case 123: step(-1)
     case 124, 49: step(1)
     case 125, 36, 76: moveGroup(1)
@@ -178,6 +209,7 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   }
   /// Badges, borders and metadata follow what is selected for the Trash.
   func refreshCards() {
+    if mode == 0 { refreshBadCard(); return }
     guard current >= 0, current < groups.count else { return }
     let g = groups[current]
     for (i, c) in cards.enumerated() where i < g.members.count {
@@ -212,7 +244,7 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     meta.stringValue = out.joined(separator: "\n")
   }
   func reloadRow(_ i: Int) {
-    guard i >= 0 && i < groups.count else { return }
+    guard i >= 0 && i < rowCount else { return }
     table.reloadData(forRowIndexes: [i], columnIndexes: [0]); table.selectRowIndexes([i], byExtendingSelection: false)
   }
   @objc func keepThis(_ b: NSButton) {
@@ -226,9 +258,14 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   }
 
   @objc func trashSelected() { confirmTrash(remove) }
-  func groupSelected(_ i: Int) -> Set<String> { i >= 0 && i < groups.count ? Set(groups[i].members.map { $0.path }).intersection(remove) : [] }
+  func groupSelected(_ i: Int) -> Set<String> {
+    if mode == 0 { return i >= 0 && i < bad.count && remove.contains(bad[i].doc.path) ? [bad[i].doc.path] : [] }
+    return i >= 0 && i < groups.count ? Set(groups[i].members.map { $0.path }).intersection(remove) : []
+  }
   @objc func trashGroup() { confirmTrash(groupSelected(current)) }
-  func updateGroupButton() { let n = groupSelected(current).count; groupBtn.title = n == 0 ? "Nothing selected in this group" : "Move \(n) selected in this group to Trash..."; groupBtn.isEnabled = n > 0 }
+  func updateGroupButton() {
+    if mode == 0 { let sel = !groupSelected(current).isEmpty; groupBtn.title = sel ? "Move this scan to Trash..." : "Marked to keep"; groupBtn.isEnabled = sel; return }
+    let n = groupSelected(current).count; groupBtn.title = n == 0 ? "Nothing selected in this group" : "Move \(n) selected in this group to Trash..."; groupBtn.isEnabled = n > 0 }
   func confirmTrash(_ paths: Set<String>) {
     guard !paths.isEmpty else { return }
     let a = NSAlert(); a.messageText = "Move \(paths.count) file\(paths.count == 1 ? "" : "s") to the Trash?"
@@ -282,8 +319,9 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
   func tierColor(_ t: Tier) -> NSColor { t == .exact ? .systemRed : t == .duplicate ? .systemOrange : .systemYellow }
 
   // MARK: group list (left)
-  func numberOfRows(in t: NSTableView) -> Int { groups.count }
+  func numberOfRows(in t: NSTableView) -> Int { rowCount }
   func tableView(_ t: NSTableView, viewFor c: NSTableColumn?, row: Int) -> NSView? {
+    if mode == 0 { return badCell(row) }
     let g = groups[row]
     let cell = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 76))
     let iv = NSImageView(frame: NSRect(x: 10, y: 8, width: 60, height: 60)); iv.imageScaling = .scaleProportionallyUpOrDown; cell.addSubview(iv)
@@ -298,7 +336,76 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     lab(n == 0 ? "nothing selected" : "\(n) selected for Trash", 10, 11, color: .secondaryLabelColor)
     return cell
   }
-  func tableViewSelectionDidChange(_ n: Notification) { if table.selectedRow >= 0 && table.selectedRow != current { showGroup(table.selectedRow) } }
+  func badCell(_ row: Int) -> NSView? {
+    guard row < bad.count else { return nil }
+    let b = bad[row], cell = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 76))
+    let iv = NSImageView(frame: NSRect(x: 10, y: 8, width: 60, height: 60)); iv.imageScaling = .scaleProportionallyUpOrDown; cell.addSubview(iv)
+    thumb(b.doc.path, 200) { iv.image = $0 }
+    func lab(_ s: String, _ y: CGFloat, _ size: CGFloat, bold: Bool = false, color: NSColor = .labelColor) {
+      let l = NSTextField(labelWithString: s); l.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size); l.textColor = color
+      l.lineBreakMode = .byTruncatingMiddle; l.frame = NSRect(x: 80, y: y, width: 215, height: 18); l.autoresizingMask = [.width]; cell.addSubview(l)
+    }
+    lab(b.q.severity == 2 ? "Bad scan" : "Check this scan", 50, 13, bold: true, color: b.q.severity == 2 ? .systemRed : .systemYellow)
+    lab((b.doc.path as NSString).lastPathComponent, 30, 11)
+    lab(remove.contains(b.doc.path) ? "selected for Trash" : "keep", 10, 11, color: .secondaryLabelColor)
+    return cell
+  }
+  func tableViewSelectionDidChange(_ n: Notification) { if table.selectedRow >= 0 && table.selectedRow != current { showCurrent(table.selectedRow) } }
+
+  // MARK: bad scans (detail)
+  func toggleBad() {
+    guard current >= 0, current < bad.count else { return }
+    let p = bad[current].doc.path
+    if remove.contains(p) { remove.remove(p) } else { remove.insert(p) }
+    refreshCounts(); reloadRow(current); refreshCards()
+  }
+  @objc func toggleBadBox(_ b: NSButton) { toggleBad() }
+  func showBad(_ i: Int) {
+    current = i
+    cardsRow.arrangedSubviews.forEach { cardsRow.removeArrangedSubview($0); $0.removeFromSuperview() }
+    cards = []; cbs = [:]; badges = [:]
+    guard i >= 0, i < bad.count else { header.stringValue = "No bad scans found."; header.textColor = .labelColor; groupBtn.isHidden = true; meta.stringValue = ""; return }
+    groupBtn.isHidden = false
+    let m = bad[i].doc, df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
+    let card = NSStackView(); card.orientation = .vertical; card.alignment = .leading; card.spacing = 5; card.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+    card.translatesAutoresizingMaskIntoConstraints = false
+    let iv = NSImageView(); iv.imageScaling = .scaleProportionallyUpOrDown; iv.imageAlignment = .alignTop; iv.wantsLayer = true
+    iv.layer?.borderWidth = 1; iv.layer?.borderColor = NSColor.separatorColor.cgColor
+    for axis in [NSLayoutConstraint.Orientation.vertical, .horizontal] { iv.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: axis); iv.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: axis) }
+    iv.identifier = NSUserInterfaceItemIdentifier(m.path); iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(open(_:))))
+    iv.toolTip = "Click to enlarge - move the mouse away to close. Option-click opens in Preview."
+    thumb(m.path, 1600) { iv.image = $0 }
+    card.addArrangedSubview(iv); iv.widthAnchor.constraint(equalTo: card.widthAnchor).isActive = true; iv.heightAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
+    func line(_ s: String, bold: Bool = false, size: CGFloat = 12, color: NSColor = .labelColor, lines: Int = 1) {
+      let l = NSTextField(wrappingLabelWithString: s); l.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size); l.textColor = color
+      l.maximumNumberOfLines = lines; l.lineBreakMode = lines == 1 ? .byTruncatingMiddle : .byWordWrapping
+      l.setContentHuggingPriority(.required, for: .vertical); l.setContentCompressionResistancePriority(.required, for: .vertical)
+      card.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: card.widthAnchor).isActive = true
+    }
+    let p = m.rec.pages[0]
+    line((m.path as NSString).lastPathComponent, bold: true, size: 13)
+    line("\(p.w)x\(p.h) - \(ByteCountFormatter.string(fromByteCount: Int64(m.size), countStyle: .file)) - \(df.string(from: Date(timeIntervalSince1970: m.mtime)))", size: 11, color: .secondaryLabelColor)
+    let badge = NSTextField(labelWithString: "TRASH"); badge.font = .boldSystemFont(ofSize: 13); badges[0] = badge; card.addArrangedSubview(badge)
+    let cb = NSButton(checkboxWithTitle: "Move to Trash", target: self, action: #selector(toggleBadBox(_:))); cb.setContentHuggingPriority(.required, for: .vertical); cbs[0] = cb; card.addArrangedSubview(cb)
+    cardsRow.addArrangedSubview(card); cards.append(card)
+    card.heightAnchor.constraint(equalTo: cardsRow.heightAnchor).isActive = true
+    refreshCards()
+  }
+  func refreshBadCard() {
+    guard current >= 0, current < bad.count else { return }
+    let b = bad[current], kept = !remove.contains(b.doc.path)
+    badges[0]?.stringValue = kept ? "KEEP" : "TRASH"; badges[0]?.textColor = kept ? .systemGreen : .systemRed
+    cbs[0]?.state = kept ? .off : .on
+    if let c = cards.first { c.wantsLayer = true; c.layer?.cornerRadius = 8; c.layer?.borderWidth = 3; c.layer?.borderColor = (kept ? NSColor.systemGreen : NSColor.systemRed).cgColor }
+    header.stringValue = "\(b.q.severity == 2 ? "Bad scan" : "Check this scan") - \(b.q.reasons.joined(separator: "; "))"
+    header.textColor = b.q.severity == 2 ? .systemRed : .systemYellow
+    let q = b.q, lines = b.doc.rec.pages[0].lines.map { $0.text }
+    meta.stringValue = ["\(b.doc.path)",
+      String(format: "      ink %.1f%%  contrast %.0f  streaks %.0f%%  unreadable ink %.0f%%  OCR %d lines at %.0f%% confidence", q.inkFrac * 100, q.contrast, q.streakFrac * 100, q.unexplained * 100, q.ocrLines, q.ocrConf * 100),
+      "      read: " + (lines.isEmpty ? "(nothing)" : lines.prefix(6).joined(separator: " | ")),
+      "      Bad scans are never matched against other scans. Nothing is deleted until you confirm."].joined(separator: "\n")
+    updateGroupButton()
+  }
 
   // MARK: detail (right)
   func showGroup(_ i: Int) {
