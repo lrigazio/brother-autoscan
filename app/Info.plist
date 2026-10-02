@@ -6,4 +6,5 @@
 <key>CFBundleExecutable</key><string>AutoScan</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSUIElement</key><true/>
+<key>NSAppleEventsUsageDescription</key><string>AutoScan asks Finder to move duplicate scans to the Trash, because macOS only lets Finder remove some protected files.</string>
 </dict></plist>

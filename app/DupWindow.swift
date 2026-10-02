@@ -241,6 +241,14 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
           do { try FileManager.default.trashItem(at: URL(fileURLWithPath: p), resultingItemURL: nil); failed.remove(p) }
           catch { why.append("\((p as NSString).lastPathComponent): \(error.localizedDescription)") }
         }
+        if !failed.isEmpty {   // protected files (com.apple.macl): only Finder may trash them, so ask it to
+          let list = failed.map { "POSIX file \"\($0.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\"" }.joined(separator: ", ")
+          var errInfo: NSDictionary?
+          NSAppleScript(source: "tell application \"Finder\" to delete {\(list)}")?.executeAndReturnError(&errInfo)
+          if let e = errInfo { why.append("Finder: \(e[NSAppleScript.errorMessage] ?? e)") }
+          failed = failed.filter { FileManager.default.fileExists(atPath: $0) }
+          if failed.isEmpty { why.removeAll() }
+        }
         appLog("trash: requested \(want.count), failed \(failed.count) \(why)")
         if !failed.isEmpty {
           let al = NSAlert(); al.alertStyle = .warning
