@@ -38,6 +38,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
   var dpiPop = NSPopUpButton(), fmtPop = NSPopUpButton(), colPop = NSPopUpButton(), qPop = NSPopUpButton()
   var cropBox = NSButton(checkboxWithTitle: "Auto-crop to content", target: nil, action: nil)
   var thumb = NSImageView()
+  var thumbPath: String?
   var seen = Set<String>()
   var qLabel = NSTextField()
   var table = NSTableView()
@@ -72,6 +73,16 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     let scansDir = dir
     DispatchQueue.global().async { _ = try? FileManager.default.contentsOfDirectory(atPath: scansDir) }
     if UserDefaults.standard.bool(forKey: "dupsPending") { dups.show(dir: scansDir) }
+    if let z = ProcessInfo.processInfo.environment["AUTOSCAN_ZOOM"], let out = ProcessInfo.processInfo.environment["AUTOSCAN_SNAPSHOT"] {   // dev: show the zoom panel and report
+      ZoomPanel.shared.show(path: z)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+        let p = ZoomPanel.shared; let v = p.contentView!
+        try? "visible=\(p.isVisible) frame=\(p.frame) screen=\(String(describing: NSScreen.main?.visibleFrame)) mouse=\(NSEvent.mouseLocation)".write(toFile: out + ".zoom.txt", atomically: true, encoding: .utf8)
+        if let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) { v.cacheDisplay(in: v.bounds, to: rep); try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out)) }
+        exit(0)
+      }
+      return
+    }
     // dev hooks: open the duplicates window on a folder, optionally snapshot it to a PNG and quit
     if let t = ProcessInfo.processInfo.environment["AUTOSCAN_DUPDIR"] {
       dups.show(dir: t)
@@ -111,6 +122,7 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     cropBox.frame = NSRect(x: 250, y: 296, width: 200, height: 22); cropBox.state = defaults.object(forKey: "crop") == nil || defaults.bool(forKey: "crop") ? .on : .off; v.addSubview(cropBox)
     thumb.frame = NSRect(x: 374, y: 164, width: 130, height: 126); thumb.imageScaling = .scaleProportionallyUpOrDown
     thumb.wantsLayer = true; thumb.layer?.borderWidth = 1; thumb.layer?.borderColor = NSColor.separatorColor.cgColor; v.addSubview(thumb)
+    thumb.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(zoomThumb))); thumb.toolTip = "Click to enlarge - move the mouse away to close"
     for p in [dpiPop, fmtPop, colPop, qPop] { p.target = self; p.action = #selector(saveSettings) }
     cropBox.target = self; cropBox.action = #selector(saveSettings); updateQuality()
     let col = NSTableColumn(identifier: .init("f")); col.title = "Captured (double-click to reveal)"; col.width = 470
@@ -132,11 +144,12 @@ class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDe
     if p.runModal() == .OK, let u = p.url { dir = u.path; folderLabel.stringValue = dir }
   }
   @objc func reveal() { let r = table.clickedRow; if r >= 0 { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: files[r])]) } }
-  func tableViewSelectionDidChange(_ n: Notification) { let r = table.selectedRow; if r >= 0 { thumb.image = NSImage(contentsOfFile: files[r]) } }
+  func tableViewSelectionDidChange(_ n: Notification) { let r = table.selectedRow; if r >= 0 { thumb.image = NSImage(contentsOfFile: files[r]); thumbPath = files[r] } }
+  @objc func zoomThumb() { if let p = thumbPath { ZoomPanel.shared.show(path: p) } }
   func numberOfRows(in t: NSTableView) -> Int { files.count }
   func tableView(_ t: NSTableView, objectValueFor c: NSTableColumn?, row: Int) -> Any? { files[row] }
   func addFile(_ path: String, note: String) {
-    files.insert(path, at: 0); table.reloadData(); thumb.image = NSImage(contentsOfFile: path)
+    files.insert(path, at: 0); table.reloadData(); thumb.image = NSImage(contentsOfFile: path); thumbPath = path
     statusLabel.stringValue = "Saved \(URL(fileURLWithPath: path).lastPathComponent) (\(note))"
     notify("Scan saved", path)
   }

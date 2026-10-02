@@ -219,7 +219,11 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     guard current >= 0, current < groups.count, let mi = groups[current].members.firstIndex(where: { $0.path == b.identifier?.rawValue }) else { return }
     apply(current, mi)
   }
-  @objc func open(_ g: NSClickGestureRecognizer) { if let p = g.view?.identifier?.rawValue { NSWorkspace.shared.open(URL(fileURLWithPath: p)) } }
+  /// Click = enlarge (goes away when the mouse leaves it); Option-click opens the file in Preview.
+  @objc func open(_ g: NSClickGestureRecognizer) {
+    guard let p = g.view?.identifier?.rawValue else { return }
+    if NSEvent.modifierFlags.contains(.option) { NSWorkspace.shared.open(URL(fileURLWithPath: p)) } else { ZoomPanel.shared.show(path: p) }
+  }
 
   @objc func trashSelected() { confirmTrash(remove) }
   func groupSelected(_ i: Int) -> Set<String> { i >= 0 && i < groups.count ? Set(groups[i].members.map { $0.path }).intersection(remove) : [] }
@@ -316,7 +320,7 @@ final class DupController: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         iv.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: axis); iv.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: axis)
       }
       iv.identifier = NSUserInterfaceItemIdentifier(m.path); iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(open(_:))))
-      iv.toolTip = "Click to open"
+      iv.toolTip = "Click to enlarge - move the mouse away to close. Option-click opens in Preview."
       thumb(m.path, 1600) { iv.image = $0 }
       card.addArrangedSubview(iv)
       iv.widthAnchor.constraint(equalTo: card.widthAnchor).isActive = true
